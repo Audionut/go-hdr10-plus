@@ -88,7 +88,7 @@ wording is not an API guarantee. Failed operations return nil results.
 The library does not close readers, open files, log, start goroutines, or mutate
 inputs. Every image owns its pixels. Concurrent renders may share unchanged
 metadata; callers must not mutate it while rendering. Applications own PNG
-encoding and handle writer errors. There is no CLI, video/SEI extraction,
+encoding and handle writer errors. There is no CLI in the plotting package,
 resampling, arbitrary sizing, or alternate output format.
 
 Both operations are synchronous and have no cancellation parameter. Applications
@@ -135,3 +135,84 @@ See [test fixture provenance](testdata/PROVENANCE.md) for the Rust oracle,
 optional real-input differential check, tolerances, and visual baselines.
 The new Go implementation is MIT licensed; retained upstream and font notices
 are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Native extraction is available in the separate `extract` package.
+`Extract(ctx, seeker, extract.Options{})` detects raw Annex B HEVC, Matroska,
+ordinary/fragmented MP4, TS and M2TS by signature;
+`DecodeT35` accepts complete registered HDR10+ payloads. The supported metadata
+dialect is application ID 4, version 1, one window, with no actual-peak grids or
+saturation mapping. Values, percentile indexes, target luminance and curves are
+retained. Metadata inheritance follows decode order before presentation ordering.
+The HEVC scope is progressive, base-layer Main/Main 10 with supported parameter
+and reference syntax. Unsupported extensions return `extract.ErrUnsupportedInput`.
+TrackID zero requires a unique HEVC video track; explicit IDs select the Matroska
+track number, MP4 track ID, or TS PID. Raw HEVC rejects nonzero IDs.
+
+| Container | Timing and selection |
+| --- | --- |
+| Matroska | All four lace modes, signed block timecodes, default/block duration, codec delay, CRC, unknown Segment/Cluster sizes; Cluster timestamp precedes its blocks |
+| MP4 | Complete ordinary tables, compact sizes, signed composition offsets, supported description changes, fragment defaults/offsets and one forward media edit with optional initial empty edit |
+| TS/M2TS | Bounded PAT/PMT/PES headers, CRC, original zero/33-bit timestamps, duplicate removal with permitted PCR updates, continuity checks and normal EOF |
+
+Encryption/compression, linked Matroska segments, CodecState changes, non-unit
+track scale, ambiguous sample timing, repeated/rate-changing MP4 edits and
+unverified transport resets fail explicitly. Samples contain one supported
+picture AU; several slices of that picture are accepted. Missing transport PTS
+can permit a frame-index result; timed playlist trims require proven clocks.
+Transport preflight checks mandatory markers, reserved bits, optional field
+extents, clocks, rates and stuffing. DSM trick modes, embedded MPEG-1 pack headers
+and embedded system headers return `extract.ErrUnsupportedInput`. PES CRC bytes
+are bounded diagnostic fields; their checksum is not verified.
+
+```go
+result, err := extract.Extract(ctx, file, extract.Options{})
+if err != nil {
+    return err
+}
+metadata, err := result.PlotMetadata()
+if err != nil {
+    return err
+}
+img, err := hdr10plus.Render(metadata, hdr10plus.Options{})
+```
+
+Applications own the context, reader lifetime and image output. Extraction is
+synchronous, reads compressed bytes through EOF, and invokes no subprocess or
+pixel decoder. Success covers identified output pictures, not universal video
+integrity: a raw cut within skipped entropy data can be structurally
+indistinguishable. Cancellation and reader errors preserve their identities;
+absence, incomplete coverage, unsupported input/metadata, malformed syntax,
+ambiguous tracks and resource exhaustion have separate `errors.Is` sentinels.
+Results own their arrays; `PlotMetadata` validates and deep-copies them.
+
+`extract.Limits{}` uses finite defaults: two million physical/output pictures,
+512 MiB accounted retained state, 64 KiB parameter sets and slice headers,
+1 MiB SEI, and at most 64 queued pictures. These quotas account owned extraction
+storage rather than process RSS. File extraction and assembly reserve 2 MiB
+for resolution plus 128 KiB for POC history. A shared `MemoryBudget` additionally bounds
+concurrent collectors and retained results for one session. Streams are single
+owner; separate streams and reservation tokens can share the budget concurrently.
+`MemoryBudget.Usage` reports charged and peak bytes. Completed results remain
+charged for that session. Container indexes and block scratch share the operation
+quota with collected syntax and output; selected compressed bodies are streamed
+or bounded by the block limit. These limits do not measure allocator overhead.
+
+`NewStream`/`Push`/`Finish` collect immutable physical `Clip` records, borrowing
+each chunk only until `Push` returns. `Abort` preserves the original failure.
+`Assemble` accepts completed clips and exact neutral playlist occurrences, with
+half-open 45-kHz trims and explicit reset/seamless connections. It replays
+decode state for each occurrence, resolves required reference lookahead and
+recomputes final scenes/profile. Assembly accepts no reader and performs no IO.
+Unknown clocks, missing references and unprovable splices return explicit errors.
+Transport `PacketRange` boundaries require observed PES starts or physical start
+and EOF. A producer that strips PES headers supplies `Marker.PESHeader` for
+validation and a final `SourceEnd` marker carrying the observed packet count.
+These borrowed headers are not retained. A packet count does not measure IO calls.
+
+The [development BDInfo bridge](integration/bdinfo/README.md) is a separate
+GPL-compatible module using the local, unreleased issue-45 API. It is absent from
+the root dependency graph. Tests cover folder/UDF ISO timelines, shared/repeated
+clips, selected STC epochs, supported seamless reference cuts, complete ES delivery
+and bounded failures. Release pinning and private-media storage/performance
+measurements remain external validation gates. No performance overhead percentage
+is claimed. See [native fixture provenance](extract/testdata/PROVENANCE.md).
