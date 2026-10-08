@@ -1,0 +1,32 @@
+# Local implementation plans and review notes
+/docs/
+
+# Go build outputs and test binaries
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Local test reports and profiles
+/coverage/
+/*.out
+/*.prof
+/*.log
+
+# Local multi-module workspace
+/go.work
+/go.work.sum
+
+# Editor and operating-system files
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini

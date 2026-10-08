@@ -1,0 +1,10 @@
+{
+  "JSONInfo": {"HDR10plusProfile": "A"},
+  "SceneInfo": [
+    {"LuminanceParameters": {"AverageRGB": 100, "MaxScl": [1000, 2000, 3000], "LuminanceDistributions": {"DistributionIndex": "ignored", "DistributionValues": [9000, 100, 5000]}}},
+    {"LuminanceParameters": {"AverageRGB": 5000, "MaxScl": [7000, 5000, 9000], "LuminanceDistributions": {"DistributionValues": [100, 10000, 8000]}}},
+    {"LuminanceParameters": {"AverageRGB": 2000, "MaxScl": [5000, 4000, 6000], "LuminanceDistributions": {"DistributionValues": [100, 7000, 6000]}}}
+  ],
+  "SceneInfoSummary": {"SceneFrameNumbers": [2, 1]},
+  "Extension": {"anything": [null, true, "accepted"]}
+}
