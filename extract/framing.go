@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"bytes"
 	"fmt"
 	hdr10plus "github.com/Audionut/go-hdr10-plus"
 	"io"
@@ -68,10 +69,10 @@ func (n *nalScanner) byte(v byte) error {
 			n.ebspZeros = 0
 		}
 	}
-	limit := n.limit()
 	if n.headerComplete && len(n.data) >= 2 && (n.data[0]>>1)&63 <= 31 {
 		return nil
 	}
+	limit := n.limit()
 	if int64(len(n.data)) >= limit {
 		if len(n.data) >= 2 && (n.data[0]>>1)&63 <= 31 {
 			return nil
@@ -121,7 +122,31 @@ func (n *nalScanner) finishNAL() error {
 }
 
 func (n *nalScanner) push(data []byte) error {
-	for _, v := range data {
+	for pos := 0; pos < len(data); pos++ {
+		if n.lengthSize != 0 && n.remaining != 0 && n.headerComplete && n.ebspZeros == 0 && !n.prevention {
+			// With a complete VCL header, nonzero body bytes need no syntax
+			// retention. Find every zero; byte() still validates zeros and
+			// escape transitions, including those across Push boundaries.
+			end := pos + int(min(n.remaining, uint64(len(data)-pos)))
+			length := bytes.IndexByte(data[pos:end], 0)
+			if length < 0 {
+				length = end - pos
+			}
+			if length > 0 {
+				n.size += uint64(length)
+				n.offset += uint64(length)
+				n.last = data[pos+length-1]
+				n.remaining -= uint64(length)
+				pos += length - 1
+				if n.remaining == 0 {
+					if err := n.finishNAL(); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+		}
+		v := data[pos]
 		position := n.offset
 		n.offset++
 		if n.lengthSize != 0 {

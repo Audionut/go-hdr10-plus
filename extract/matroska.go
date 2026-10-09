@@ -678,12 +678,20 @@ func (f *mkvFile) segment(e mkvElement, collect bool) error {
 			if !collect {
 				err = f.parseInfo(child)
 			} else {
+				if f.info {
+					return fieldError("duplicate-SegmentInfo", ErrInvalidBitstream)
+				}
+				f.info = true
 				err = c.skip(child)
 			}
 		case mkvTracks:
 			if !collect {
 				err = f.parseTracks(child)
 			} else {
+				if f.trackTable {
+					return fieldError("duplicate-Tracks", ErrInvalidBitstream)
+				}
+				f.trackTable = true
 				err = c.skip(child)
 			}
 		case mkvCluster:
@@ -703,6 +711,11 @@ func (f *mkvFile) segment(e mkvElement, collect bool) error {
 		}
 		if err != nil {
 			return err
+		}
+		if !collect && f.info && f.trackTable {
+			// Collection validates the rest of the Segment, including late
+			// duplicate metadata. Do not seek through every Cluster first.
+			return c.leave()
 		}
 	}
 }
@@ -1037,12 +1050,6 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 	if err := f.segment(segment, false); err != nil {
 		return nil, err
 	}
-	if _, err := c.root(); err != io.EOF {
-		if err == nil {
-			return nil, fieldError("multiple-segments", ErrUnsupportedInput)
-		}
-		return nil, err
-	}
 	if !f.info || !f.trackTable {
 		return nil, fieldError("missing-Info/Tracks", ErrInvalidBitstream)
 	}
@@ -1063,6 +1070,7 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 	c.pending = nil
 	c.scopes = c.scopes[:0]
 	c.discovery = false
+	f.info, f.trackTable = false, false
 	head, err = c.root()
 	if err != nil {
 		return nil, err
