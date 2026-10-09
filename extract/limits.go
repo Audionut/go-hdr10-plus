@@ -75,7 +75,7 @@ func (b *MemoryBudget) Reserve(bytes int64) (*Reservation, error) {
 		return nil, fmt.Errorf("%w: uninitialized budget", hdr10plus.ErrInvalidOptions)
 	}
 	if bytes > b.max-b.used {
-		return nil, ErrResourceLimit
+		return nil, fmt.Errorf("%w: shared retained storage: request=%d used=%d limit=%d", ErrResourceLimit, bytes, b.used, b.max)
 	}
 	b.used += bytes
 	b.peak = max(b.peak, b.used)

@@ -370,7 +370,7 @@ func (s *Stream) nal(data []byte, offset, size uint64) error {
 		newCharge, err := s.memory.reserve(int64(capacity) * 96)
 		if err != nil {
 			c.release()
-			return err
+			return fieldError("NAL-event-index", fmt.Errorf("capacity=%d: %w", capacity, err))
 		}
 		buf := make([]nalEvent, len(s.events), capacity)
 		copy(buf, s.events)
@@ -477,7 +477,7 @@ func (s *Stream) Push(ctx context.Context, chunk Chunk) error {
 			capacity := max(16, 2*cap(s.markers))
 			c, err := s.memory.reserve(int64(capacity) * 144)
 			if err != nil {
-				return fail(err)
+				return fail(fieldError("timing-marker-index", fmt.Errorf("capacity=%d: %w", capacity, err)))
 			}
 			buf := make([]Marker, len(s.markers), capacity)
 			copy(buf, s.markers)

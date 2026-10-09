@@ -1,5 +1,7 @@
 package extract
 
+import "fmt"
+
 type accounting struct {
 	max, used int64
 	shared    *MemoryBudget
@@ -16,12 +18,12 @@ type charge struct {
 func (a *accounting) reserve(bytes int64) (*charge, error) {
 	// Includes conservative space for charge and reservation bookkeeping.
 	if bytes < 0 || bytes > a.max-a.used-128 {
-		return nil, ErrResourceLimit
+		return nil, fmt.Errorf("%w: operation retained storage: request=%d overhead=128 used=%d limit=%d", ErrResourceLimit, bytes, a.used, a.max)
 	}
 	bytes += 128
 	for scope := a.parent; scope != nil; scope = scope.parent {
 		if bytes > scope.max-scope.used {
-			return nil, ErrResourceLimit
+			return nil, fmt.Errorf("%w: parent retained storage: request=%d used=%d limit=%d", ErrResourceLimit, bytes, scope.used, scope.max)
 		}
 	}
 	var token *Reservation

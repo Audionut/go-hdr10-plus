@@ -45,6 +45,11 @@ type mkvCursor struct {
 	discovery, excludeCRC bool
 	readErr               error
 	buffer                []byte
+	readBuffer            []byte
+	readStart             int64
+	readLength            int
+	bufferErr             error
+	discoveryEnd          int64
 }
 
 func (c *mkvCursor) Read(p []byte) (int, error) {
@@ -57,9 +62,34 @@ func (c *mkvCursor) Read(p []byte) (int, error) {
 	if len(p) > 32768 {
 		p = p[:32768]
 	}
-	n, err := c.r.Read(p)
-	if n == 0 && err == nil && len(p) != 0 {
-		err = io.ErrNoProgress
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.pos < c.readStart || c.pos >= c.readStart+int64(c.readLength) {
+		c.readStart = c.pos
+		length := len(c.readBuffer)
+		if c.discovery {
+			// Only known metadata bodies are safe to read ahead. Element
+			// headers can precede a video body that discovery must not read.
+			length = len(p)
+			if c.pos < c.discoveryEnd {
+				length = int(min(int64(len(c.readBuffer)), c.discoveryEnd-c.pos))
+			}
+		}
+		c.readLength, c.bufferErr = c.r.Read(c.readBuffer[:length])
+		if c.readLength == 0 && c.bufferErr == nil {
+			c.bufferErr = io.ErrNoProgress
+		}
+		if c.bufferErr != nil && c.bufferErr != io.EOF {
+			// A read error must survive even if read-ahead supplied all bytes
+			// requested by io.ReadFull or the parser subsequently skips them.
+			c.readErr = c.bufferErr
+		}
+	}
+	n := copy(p, c.readBuffer[int(c.pos-c.readStart):c.readLength])
+	err := c.readErr
+	if err == nil && c.pos+int64(n) == c.readStart+int64(c.readLength) {
+		err = c.bufferErr
 	}
 	c.pos += int64(n)
 	if n > 0 && !c.discovery {
@@ -69,10 +99,29 @@ func (c *mkvCursor) Read(p []byte) (int, error) {
 			}
 		}
 	}
-	if err != nil && err != io.EOF {
-		c.readErr = err
-	}
 	return n, err
+}
+
+func (c *mkvCursor) seek(position int64) error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	if c.readErr != nil {
+		return c.readErr
+	}
+	if position >= c.readStart && position <= c.readStart+int64(c.readLength) {
+		c.pos = position
+		return nil
+	}
+	pos, err := c.r.Seek(position, io.SeekStart)
+	if err != nil {
+		return err
+	}
+	if pos != position {
+		return io.ErrUnexpectedEOF
+	}
+	c.pos, c.readStart, c.readLength, c.bufferErr = pos, pos, 0, nil
+	return nil
 }
 func (c *mkvCursor) vint(id bool) (uint64, int, bool, error) {
 	var b [8]byte
@@ -105,6 +154,9 @@ func (c *mkvCursor) next(end int64) (mkvElement, error) {
 	for {
 		if err := c.ctx.Err(); err != nil {
 			return mkvElement{}, err
+		}
+		if c.readErr != nil {
+			return mkvElement{}, c.readErr
 		}
 		if c.pending != nil {
 			e := *c.pending
@@ -219,15 +271,7 @@ func (c *mkvCursor) discard(end int64) error {
 		checksumming = checksumming || s.checksum && !c.discovery
 	}
 	if !checksumming {
-		pos, err := c.r.Seek(end, io.SeekStart)
-		if err != nil {
-			return err
-		}
-		if pos != end {
-			return io.ErrUnexpectedEOF
-		}
-		c.pos = pos
-		return nil
+		return c.seek(end)
 	}
 	for c.pos < end {
 		n := min(int64(len(c.buffer)), end-c.pos)
@@ -245,6 +289,16 @@ func mkvMaster(id uint64) bool {
 	return false
 }
 func (c *mkvCursor) skip(e mkvElement) error {
+	if e.id == 0x45dd {
+		value, err := c.uint(e)
+		if err != nil {
+			return err
+		}
+		if value != 0 {
+			return fieldError("ordered-chapters", ErrUnsupportedInput)
+		}
+		return nil
+	}
 	if !mkvMaster(e.id) {
 		return c.discard(e.end)
 	}
@@ -263,16 +317,6 @@ func (c *mkvCursor) skip(e mkvElement) error {
 			c.scopes[len(c.scopes)-1].crc = child.priorCRC
 			c.pending = &child
 			return c.leave()
-		}
-		if child.id == 0x45dd {
-			value, err := c.uint(child)
-			if err != nil {
-				return err
-			}
-			if value != 0 {
-				return fieldError("ordered-chapters", ErrUnsupportedInput)
-			}
-			continue
 		}
 		if err := c.skip(child); err != nil {
 			return err
@@ -623,6 +667,12 @@ func (f *mkvFile) segment(e mkvElement, collect bool) error {
 		if err != nil {
 			return err
 		}
+		if !collect {
+			c.discoveryEnd = c.pos
+			if child.id != mkvCluster {
+				c.discoveryEnd = child.end
+			}
+		}
 		switch child.id {
 		case mkvInfo:
 			if !collect {
@@ -639,6 +689,10 @@ func (f *mkvFile) segment(e mkvElement, collect bool) error {
 		case mkvCluster:
 			if collect {
 				err = f.cluster(child)
+			} else if !child.unknown {
+				// Collection validates every cluster below; discovery only
+				// needs to find Info/Tracks, without touching video bytes.
+				err = c.discard(child.end)
 			} else {
 				err = c.skip(child)
 			}
@@ -936,7 +990,7 @@ func (f *mkvFile) pushBlock(b *ebml.Block, cluster, duration uint64, hasDuration
 func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limits) (result *Extraction, err error) {
 	memory := &accounting{max: l.MaxRetainedBytes, shared: opts.Budget}
 	defer memory.release()
-	if _, err := memory.reserve(32768 + 4096); err != nil {
+	if _, err := memory.reserve(2*32768 + 4096); err != nil {
 		return nil, err
 	}
 	start, err := r.Seek(0, io.SeekCurrent)
@@ -950,8 +1004,20 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 	if _, err := r.Seek(start, io.SeekStart); err != nil {
 		return nil, err
 	}
-	c := &mkvCursor{ctx: ctx, r: r, pos: start, size: size, limits: l, memory: memory, discovery: true, buffer: make([]byte, 32768)}
+	c := &mkvCursor{ctx: ctx, r: r, pos: start, size: size, limits: l, memory: memory, discovery: true, buffer: make([]byte, 32768), readBuffer: make([]byte, 32768)}
 	defer func() {
+		// Restore the caller's seek position to the last consumed byte if an
+		// error leaves unread look-ahead in the cache.
+		if c.readLength > 0 && c.pos != c.readStart+int64(c.readLength) {
+			position, seekErr := r.Seek(c.pos, io.SeekStart)
+			if seekErr == nil && position != c.pos {
+				seekErr = io.ErrUnexpectedEOF
+			}
+			if seekErr != nil {
+				result = nil
+				err = errors.Join(err, seekErr)
+			}
+		}
 		if err != nil {
 			err = &Error{Container: "Matroska", Offset: uint64(max(0, c.pos)), OffsetKnown: true, Field: "container", Err: err}
 		}
@@ -991,10 +1057,9 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 		f.tracks[i].config = nil
 		f.tracks[i].configCharge.release()
 	}
-	if _, err := r.Seek(start, io.SeekStart); err != nil {
+	if err := c.seek(start); err != nil {
 		return nil, err
 	}
-	c.pos = start
 	c.pending = nil
 	c.scopes = c.scopes[:0]
 	c.discovery = false
