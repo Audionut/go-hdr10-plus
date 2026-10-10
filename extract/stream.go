@@ -229,7 +229,7 @@ func (s *Stream) config(data []byte) error {
 			if kind == 39 || kind == 40 {
 				limit = s.limits.MaxSEIBytes
 			}
-			if int64(n) > limit {
+			if !ignoredNAL(data[pos:pos+n]) && int64(n) > limit {
 				return fieldError("hvcC-NAL-bytes", ErrResourceLimit)
 			}
 			if (data[pos]>>1)&63 != kind {
@@ -254,10 +254,9 @@ func (s *Stream) nal(data []byte, offset, size uint64) error {
 		return fieldError("NAL-header", ErrInvalidBitstream)
 	}
 	kind := (data[0] >> 1) & 63
-	layer := (uint16(data[0]&1) << 5) | uint16(data[1]>>3)
-	if layer != 0 {
+	if ignoredNAL(data) {
 		return nil
-	} // ancillary enhancement-layer data never adds base pictures
+	} // Ancillary bodies never add base pictures or HDR10+ metadata.
 	if kind <= 31 && (kind > 21 || kind >= 10 && kind <= 15) {
 		return fieldError("reserved-VCL-kind", ErrUnsupportedInput)
 	}

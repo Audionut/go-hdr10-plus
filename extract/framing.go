@@ -29,8 +29,15 @@ type nalScanner struct {
 	prefix                         func([]byte) (bool, error)
 }
 
+// ignoredNAL matches the collector's ancillary-kind and enhancement-layer
+// filtering. Their bodies still undergo incremental EBSP/framing validation.
+func ignoredNAL(data []byte) bool {
+	kind := (data[0] >> 1) & 63
+	return (uint16(data[0]&1)<<5)|uint16(data[1]>>3) != 0 || kind == 38 || kind >= 41
+}
+
 func (n *nalScanner) limit() int64 {
-	if len(n.data) < 2 {
+	if len(n.data) < 2 || ignoredNAL(n.data) {
 		return 2
 	}
 	kind := (n.data[0] >> 1) & 63
@@ -39,9 +46,6 @@ func (n *nalScanner) limit() int64 {
 	}
 	if kind == 39 || kind == 40 {
 		return n.maxSEI
-	}
-	if kind >= 32 && kind <= 34 {
-		return n.maxParameter
 	}
 	return n.maxParameter
 }
@@ -69,7 +73,7 @@ func (n *nalScanner) byte(v byte) error {
 			n.ebspZeros = 0
 		}
 	}
-	if n.headerComplete && len(n.data) >= 2 && (n.data[0]>>1)&63 <= 31 {
+	if len(n.data) >= 2 && (ignoredNAL(n.data) || n.headerComplete && (n.data[0]>>1)&63 <= 31) {
 		return nil
 	}
 	limit := n.limit()
@@ -77,7 +81,7 @@ func (n *nalScanner) byte(v byte) error {
 		if len(n.data) >= 2 && (n.data[0]>>1)&63 <= 31 {
 			return nil
 		}
-		return fieldError("NAL-syntax-bytes", ErrResourceLimit)
+		return fieldError("NAL-syntax-bytes", fmt.Errorf("kind=%d layer=%d bytes=%d limit=%d: %w", (n.data[0]>>1)&63, (uint16(n.data[0]&1)<<5)|uint16(n.data[1]>>3), n.size, limit, ErrResourceLimit))
 	}
 	if len(n.data) == cap(n.data) {
 		capacity := min(int(limit), max(2, 2*cap(n.data)))
@@ -86,7 +90,7 @@ func (n *nalScanner) byte(v byte) error {
 		}
 	}
 	n.data = append(n.data, v)
-	if !n.headerComplete && len(n.data) >= 2 && (n.data[0]>>1)&63 <= 31 && (len(n.data)&(len(n.data)-1) == 0 || int64(len(n.data)) == limit) && n.prefix != nil {
+	if !n.headerComplete && len(n.data) >= 2 && !ignoredNAL(n.data) && (n.data[0]>>1)&63 <= 31 && (len(n.data)&(len(n.data)-1) == 0 || int64(len(n.data)) == limit) && n.prefix != nil {
 		complete, err := n.prefix(n.data)
 		if err != nil {
 			return err
@@ -123,9 +127,9 @@ func (n *nalScanner) finishNAL() error {
 
 func (n *nalScanner) push(data []byte) error {
 	for pos := 0; pos < len(data); pos++ {
-		if n.lengthSize != 0 && n.remaining != 0 && n.headerComplete && n.ebspZeros == 0 && !n.prevention {
-			// With a complete VCL header, nonzero body bytes need no syntax
-			// retention. Find every zero; byte() still validates zeros and
+		if n.lengthSize != 0 && n.remaining != 0 && len(n.data) >= 2 && (n.headerComplete || ignoredNAL(n.data)) && n.ebspZeros == 0 && !n.prevention {
+			// Complete VCL headers and ignored NALs need no body retention.
+			// Find every zero; byte() still validates zeros and
 			// escape transitions, including those across Push boundaries.
 			end := pos + int(min(n.remaining, uint64(len(data)-pos)))
 			length := bytes.IndexByte(data[pos:end], 0)
