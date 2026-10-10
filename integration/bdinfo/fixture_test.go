@@ -63,7 +63,8 @@ func discFixture(t testing.TB) string {
 		binary.BigEndian.PutUint32(item[16:], 4500)
 		stn := make([]byte, 14)
 		stn[2] = 1
-		stn = append(stn, 3, 1, 0x10, 0x11, 3, 0x24, 0x61, 0x30)
+		// HEVC attributes include format/rate, dynamic-range/color and flags.
+		stn = append(stn, 3, 1, 0x10, 0x11, 4, 0x24, 0x61, 0x30, 0)
 		item = append(item, 0, byte(len(stn)))
 		item = append(item, stn...)
 		list = append(list, 0, byte(len(item)))

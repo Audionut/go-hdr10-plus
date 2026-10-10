@@ -129,7 +129,7 @@ func reviewCandidate9EpochBoundary(t *testing.T, boundary int, later, bad bool) 
 				t.Fatal(e)
 			}
 			data[87] = 8
-			data[145] = 8
+			data[146] = 8
 			if e = os.WriteFile(path, data, 0644); e != nil {
 				t.Fatal(e)
 			}

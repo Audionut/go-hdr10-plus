@@ -773,34 +773,68 @@ func makeExtraction(ctx context.Context, pictures []resolvedPicture, l Limits, b
 	if unknown {
 		return nil, ErrIncomplete
 	}
+	// Bound the multiplications below before reserving or allocating indexes.
+	if int64(len(pictures)) > (l.MaxRetainedBytes-512)/128 {
+		return nil, ErrResourceLimit
+	}
 	a := &accounting{max: l.MaxRetainedBytes, shared: budget, parent: parent}
-	// Upper bounds reserve before all result allocations, including growth and
-	// distinct payload arrays. Completed result charges remain session-owned.
-	bytes := int64(len(pictures)) * 1024
+	// Cover the temporary pointer index, including map growth. Its charge
+	// overlaps collected syntax, resolver state and the completed result.
+	indexCharge, err := a.reserve(512 + int64(len(pictures))*64)
+	if err != nil {
+		return nil, err
+	}
+	defer indexCharge.release()
+	indexes := make(map[*Payload]uint32)
+	scenes := 1
+	for i, p := range pictures {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, exists := indexes[p.payload]; !exists {
+			if uint64(len(indexes)) > math.MaxUint32 {
+				return nil, ErrResourceLimit
+			}
+			indexes[p.payload] = uint32(len(indexes))
+		}
+		if i > 0 && !sceneEqual(*p.payload, *pictures[i-1].payload) {
+			scenes++
+		}
+	}
+	// Fixed capacities avoid per-frame payload/scene slots and slice growth.
+	// Bounds include 64-bit Picture/Payload layouts, up to ten distributions,
+	// a Curve with nine anchors, and rounding of cloned slice capacities.
+	bytes := 512 + int64(len(pictures))*128
+	if int64(len(indexes)) > (l.MaxRetainedBytes-bytes)/256 {
+		return nil, ErrResourceLimit
+	}
+	bytes += int64(len(indexes)) * 256
+	if int64(scenes) > (l.MaxRetainedBytes-bytes)/8 {
+		return nil, ErrResourceLimit
+	}
+	bytes += int64(scenes) * 8
 	if _, err := a.reserve(bytes); err != nil {
 		return nil, err
 	}
-	e := &Extraction{Frames: make([]Picture, 0, len(pictures)), Payloads: make([]Payload, 0, len(pictures)), SceneStarts: make([]uint64, 0, len(pictures)), memory: a}
-	indexes := make(map[*Payload]uint32)
-	for _, p := range pictures {
+	e := &Extraction{Frames: make([]Picture, len(pictures)), Payloads: make([]Payload, 0, len(indexes)), SceneStarts: make([]uint64, 0, scenes), Profile: pictures[0].payload.profile(), memory: a}
+	for i, p := range pictures {
 		if err := ctx.Err(); err != nil {
 			a.release()
 			return nil, err
 		}
-		index, exists := indexes[p.payload]
-		if !exists {
-			if uint64(len(e.Payloads)) > math.MaxUint32 {
-				a.release()
-				return nil, ErrResourceLimit
-			}
-			index = uint32(len(e.Payloads))
-			indexes[p.payload] = index
+		index := indexes[p.payload]
+		if int(index) == len(e.Payloads) {
 			e.Payloads = append(e.Payloads, clonePayload(*p.payload))
 		}
 		f := p.picture
 		f.PayloadIndex = index
-		e.Frames = append(e.Frames, f)
+		e.Frames[i] = f
+		if p.payload.profile() != e.Profile {
+			e.Profile = "N/A"
+		}
+		if i == 0 || !sceneEqual(*p.payload, *pictures[i-1].payload) {
+			e.SceneStarts = append(e.SceneStarts, uint64(i))
+		}
 	}
-	e.Profile, e.SceneStarts = e.captions()
 	return e, nil
 }

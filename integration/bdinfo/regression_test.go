@@ -139,7 +139,7 @@ func TestSelectedSTCEpoch(t *testing.T) {
 			t.Fatal(err)
 		}
 		data[87] = 8
-		data[145] = 8
+		data[146] = 8
 		if err := os.WriteFile(path, data, 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +164,7 @@ func TestFailedPlaylistOutcomesStayBounded(t *testing.T) {
 	mp := filepath.Join(root, "BDMV", "PLAYLIST", "00000.mpls")
 	m, _ := os.ReadFile(mp)
 	m[86] = 5
-	m[144] = 5
+	m[145] = 5
 	for i := 0; i < 1500; i++ {
 		name := fmt.Sprintf("%05d.mpls", i)
 		if err := os.WriteFile(filepath.Join(root, "BDMV", "PLAYLIST", name), m, 0644); err != nil {

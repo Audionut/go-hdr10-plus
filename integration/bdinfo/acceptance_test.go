@@ -135,10 +135,10 @@ func TestPublicScanSeamlessReferenceCut(t *testing.T) {
 		for _, name := range []string{"00000", "00001"} {
 			path := filepath.Join(root, "BDMV", "PLAYLIST", name+".mpls")
 			mpls := fixtureRead(t, path)
-			copy(mpls[134:], "00002")
-			mpls[144] = connection
+			copy(mpls[135:], "00002")
+			mpls[145] = connection
 			binary.BigEndian.PutUint32(mpls[92:], 1500)
-			binary.BigEndian.PutUint32(mpls[150:], 1500)
+			binary.BigEndian.PutUint32(mpls[151:], 1500)
 			fixtureWrite(t, path, mpls)
 		}
 		settings := scanner.DefaultSettings(".")
