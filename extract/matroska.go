@@ -1,7 +1,7 @@
 package extract
 
 // Matroska/EBML envelope and timestamps follow RFC 8794 and RFC 9559.
-// ebml-go supplies block and all four lacing decoders; traversal stays synchronous.
+// ebml-go supplies laced block decoding; traversal stays synchronous.
 import (
 	"bytes"
 	"context"
@@ -383,6 +383,8 @@ type mkvFile struct {
 	selected         *mkvTrack
 	stream           *Stream
 	esOffset         uint64
+	blockBuffer      []byte
+	blockCharge      *charge
 }
 
 func (f *mkvFile) header(e mkvElement) error {
@@ -770,25 +772,48 @@ func (f *mkvFile) block(e mkvElement) (*ebml.Block, *charge, error) {
 	if size > math.MaxInt64/2-32768 || size > int64(math.MaxInt) {
 		return nil, nil, ErrResourceLimit
 	}
-	token, err := c.memory.reserve(2*size + 32768)
-	if err != nil {
-		return nil, nil, err
+	if int64(cap(f.blockBuffer)) < size {
+		capacity := min(c.limits.MaxBlockBytes, int64(math.MaxInt), math.MaxInt64/2-32768, max(size, 2*int64(cap(f.blockBuffer))))
+		token, err := c.memory.reserve(capacity + 32768)
+		if err != nil {
+			return nil, nil, err
+		}
+		f.blockBuffer = make([]byte, capacity)
+		f.blockCharge.release()
+		f.blockCharge = token
+	}
+	var token *charge
+	if flags&6 != 0 {
+		var err error
+		token, err = c.memory.reserve(size + 32768)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	rest := &io.LimitedReader{R: c, N: e.end - c.pos}
-	data := make([]byte, size)
+	data := f.blockBuffer[:size]
 	copy(data, prefix[:n])
 	if _, err := io.ReadFull(rest, data[n:]); err != nil {
 		token.release()
 		return nil, nil, containerReadError("Block", err)
 	}
-	if err := preflightLace(data[n:], flags>>1&3); err != nil {
-		token.release()
-		return nil, nil, err
-	}
-	block, err := ebml.UnmarshalBlock(bytes.NewReader(data), size)
-	if err != nil {
-		token.release()
-		return nil, nil, containerReadError("Block-lacing", errors.Join(ErrInvalidBitstream, err))
+	var block *ebml.Block
+	if flags&6 == 0 {
+		// No lacing header or frame copy is needed: the validated block extent
+		// already defines its only frame. Push consumes this borrowed storage
+		// before any subsequent selected block can reuse the buffer.
+		block = &ebml.Block{TrackNumber: number, Timecode: int16(binary.BigEndian.Uint16(prefix[width : width+2])), Keyframe: flags&0x80 != 0, Invisible: flags&8 != 0, Discardable: flags&1 != 0, Data: [][]byte{data[n:]}}
+	} else {
+		if err := preflightLace(data[n:], flags>>1&3); err != nil {
+			token.release()
+			return nil, nil, err
+		}
+		var err error
+		block, err = ebml.UnmarshalBlock(bytes.NewReader(data), size)
+		if err != nil {
+			token.release()
+			return nil, nil, containerReadError("Block-lacing", errors.Join(ErrInvalidBitstream, err))
+		}
 	}
 	if rest.N != 0 || c.readErr != nil {
 		token.release()
@@ -1092,6 +1117,8 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 		}
 		return nil, err
 	}
+	f.blockBuffer = nil
+	f.blockCharge.release()
 	return finishFile(ctx, f.stream, l, opts.Budget)
 }
 
