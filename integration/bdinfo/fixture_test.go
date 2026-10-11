@@ -27,6 +27,7 @@ func discFixture(t testing.TB) string {
 	clpi := make([]byte, 60)
 	copy(clpi, "HDMV0200")
 	binary.BigEndian.PutUint32(clpi[8:], 60)
+	binary.BigEndian.PutUint32(clpi[40:], 16)
 	binary.BigEndian.PutUint32(clpi[56:], 2)
 	seq := make([]byte, 22)
 	seq[1] = 1
