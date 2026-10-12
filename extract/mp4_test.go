@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -215,6 +216,30 @@ func TestMP4DescriptionsEditsAndLargeRational(t *testing.T) {
 	}
 	if compareTime(e.Frames[0].PTS, want) != 0 || e.Frames[0].PTS.Timescale <= 1<<32 {
 		t.Fatalf("edit precision %+v want%+v", e.Frames[0].PTS, want)
+	}
+	var stream *Stream
+	reader := &sampleReadCounter{Reader: bytes.NewReader(data), start: int(offsets[0]), end: len(data)}
+	if err := Walk(t.Context(), reader, Options{}, func(info SourceInfo) (Consumer, error) {
+		var err error
+		stream, err = NewStream(StreamOptions{Key: info.Key, Framing: info.Framing, LengthSize: info.LengthSize, CodecConfig: info.CodecConfig, PresentationEdit: info.Edit})
+		return stream, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clip, err := stream.Finish(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := FinalizeStandalone(t.Context(), clip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shared.Release()
+	if !reflect.DeepEqual(e.Frames, shared.Frames) || !reflect.DeepEqual(e.Payloads, shared.Payloads) || !reflect.DeepEqual(e.SceneStarts, shared.SceneStarts) {
+		t.Fatal("shared MP4 configuration/edit handling changed extraction")
+	}
+	if reader.bytes != reader.end-reader.start {
+		t.Fatalf("shared MP4 reread samples: %d", reader.bytes)
 	}
 }
 func mp4FragmentFile(t testing.TB, explicit, defaultRun bool) []byte {

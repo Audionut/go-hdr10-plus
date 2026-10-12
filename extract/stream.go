@@ -64,6 +64,7 @@ type StreamOptions struct {
 	Framing              Framing
 	LengthSize           int
 	CodecConfig          []byte
+	PresentationEdit     *PresentationEdit
 	RetainBoundarySyntax bool
 	Limits               Limits
 	Budget               *MemoryBudget
@@ -88,6 +89,9 @@ type Clip struct {
 	limits      Limits
 	boundary    bool
 	packetRange *PacketRange
+	frames      int64
+	released    bool
+	edit        *PresentationEdit
 }
 
 // Stream consumes a compressed stream synchronously. It is not safe for
@@ -121,10 +125,17 @@ func NewStream(opts StreamOptions) (*Stream, error) {
 		return nil, err
 	}
 	a := &accounting{max: l.MaxRetainedBytes, shared: opts.Budget}
-	return newStream(opts, l, a)
+	s, err := newStream(opts, l, a)
+	if err != nil {
+		a.release()
+	}
+	return s, err
 }
 
 func newStream(opts StreamOptions, l Limits, a *accounting) (*Stream, error) {
+	if err := opts.PresentationEdit.validate(); err != nil {
+		return nil, err
+	}
 	if opts.Framing > LengthPrefixed || opts.Framing == AnnexB && opts.LengthSize != 0 || opts.Framing == LengthPrefixed && (opts.LengthSize < 1 || opts.LengthSize > 4) {
 		return nil, fmt.Errorf("%w: framing/length size", hdr10plus.ErrInvalidOptions)
 	}
@@ -132,6 +143,10 @@ func newStream(opts StreamOptions, l Limits, a *accounting) (*Stream, error) {
 		return nil, err
 	}
 	s := &Stream{opts: opts, limits: l, memory: a}
+	if opts.PresentationEdit != nil {
+		edit := *opts.PresentationEdit
+		s.opts.PresentationEdit = &edit
+	}
 	s.opts.CodecConfig = nil
 	s.opts.Key.SourceID = strings.Clone(opts.Key.SourceID)
 	s.opts.Key.ClipID = strings.Clone(opts.Key.ClipID)
@@ -199,6 +214,34 @@ func (s *Stream) growBuffer(capacity int) error {
 	s.bufferCharge.release()
 	s.bufferCharge = c
 	return nil
+}
+
+// Configure replaces hvcC at a complete sample boundary. Failure terminates the
+// collector; configuration bytes are not retained.
+func (s *Stream) Configure(ctx context.Context, data []byte) error {
+	if s == nil || ctx == nil {
+		return hdr10plus.ErrInvalidOptions
+	}
+	if s.terminal != nil {
+		return s.terminal
+	}
+	if s.finished || s.sourceEnded {
+		return fieldError("finished-stream", ErrIncomplete)
+	}
+	err := ctx.Err()
+	if err == nil {
+		if s.opts.Framing != LengthPrefixed || len(data) < 23 || data[0] != 1 {
+			err = fieldError("hvcC", ErrInvalidBitstream)
+		} else {
+			s.opts.LengthSize = int(data[21]&3) + 1
+			s.scanner.lengthSize = s.opts.LengthSize
+			err = s.config(data)
+		}
+	}
+	if err != nil {
+		s.Abort(err)
+	}
+	return err
 }
 
 func (s *Stream) config(data []byte) error {
@@ -547,6 +590,8 @@ func (s *Stream) Finish(ctx context.Context) (*Clip, error) {
 	s.lastPayload = nil
 	s.scanner.data = nil
 	c := &Clip{key: s.opts.Key, events: s.events, markers: s.markers, memory: s.memory, limits: s.limits, boundary: s.opts.RetainBoundarySyntax}
+	c.frames = s.frames
+	c.edit = s.opts.PresentationEdit
 	s.events = nil
 	s.markers = nil
 	return c, nil

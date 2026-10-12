@@ -636,8 +636,36 @@ func (f *mp4File) validateSamples(t *mp4Track) error {
 	}
 	return nil
 }
-func (f *mp4File) collect(t *mp4Track) (*Stream, error) {
-	s, err := newStream(StreamOptions{Framing: LengthPrefixed, LengthSize: 4, Key: StreamKey{TrackID: uint64(t.id)}, Limits: f.l, Budget: f.memory.shared}, f.l, f.memory)
+func (f *mp4File) collect(t *mp4Track, factory ConsumerFactory) (*Stream, error) {
+	var native *Stream
+	var consumer Consumer
+	var err error
+	description := uint32(0)
+	key := StreamKey{TrackID: uint64(t.id)}
+	if factory == nil {
+		native, err = newStream(StreamOptions{Framing: LengthPrefixed, LengthSize: 4, Key: key, Limits: f.l, Budget: f.memory.shared}, f.l, f.memory)
+		consumer = native
+	} else {
+		if len(t.samples) == 0 {
+			return nil, fieldError("empty-MP4-track", ErrIncomplete)
+		}
+		description = t.samples[0].description
+		if description == 0 || uint64(description) > uint64(len(t.configs)) {
+			return nil, fieldError("sample-description", ErrUnsupportedInput)
+		}
+		config := t.configs[description-1]
+		if len(config) < 23 || config[0] != 1 {
+			return nil, fieldError("hvcC", ErrInvalidBitstream)
+		}
+		edit, editErr := f.presentationEdit(t)
+		if editErr != nil {
+			return nil, editErr
+		}
+		consumer, err = factory(SourceInfo{Format: MP4, Key: key, Framing: LengthPrefixed, LengthSize: int(config[21]&3) + 1, CodecConfig: config, Edit: edit})
+		if err == nil && consumer == nil {
+			err = fieldError("nil-consumer", ErrUnsupportedInput)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -646,7 +674,6 @@ func (f *mp4File) collect(t *mp4Track) (*Stream, error) {
 	}
 	buffer := make([]byte, 32768)
 	var es uint64
-	description := uint32(0)
 	for i, sample := range t.samples {
 		if !f.inMedia(sample) {
 			return nil, fieldError("sample-mdat-extent", errors.Join(ErrInvalidBitstream, ErrIncomplete))
@@ -659,9 +686,11 @@ func (f *mp4File) collect(t *mp4Track) (*Stream, error) {
 			if len(config) < 23 || config[0] != 1 {
 				return nil, ErrInvalidBitstream
 			}
-			s.opts.LengthSize = int(config[21]&3) + 1
-			s.scanner.lengthSize = s.opts.LengthSize
-			if err := s.config(config); err != nil {
+			configurable, ok := consumer.(ConfigurableConsumer)
+			if !ok {
+				return nil, fieldError("sample-configuration-change", ErrUnsupportedInput)
+			}
+			if err := configurable.Configure(f.ctx, config); err != nil {
 				return nil, err
 			}
 			description = sample.description
@@ -688,8 +717,8 @@ func (f *mp4File) collect(t *mp4Track) (*Stream, error) {
 			if amount > math.MaxUint64-es {
 				return nil, ErrResourceLimit
 			}
-			if err := s.Push(f.ctx, chunk); err != nil {
-				return nil, &Error{Container: "MP4", Stream: s.opts.Key, Offset: sample.offset, OffsetKnown: true, AU: uint64(i), AUKnown: true, Field: "sample", Err: err}
+			if err := consumer.Push(f.ctx, chunk); err != nil {
+				return nil, &Error{Container: "MP4", Stream: key, Offset: sample.offset, OffsetKnown: true, AU: uint64(i), AUKnown: true, Field: "sample", Err: err}
 			}
 			es += amount
 			remaining -= amount
@@ -698,11 +727,19 @@ func (f *mp4File) collect(t *mp4Track) (*Stream, error) {
 	if f.readErr != nil {
 		return nil, f.readErr
 	}
-	return s, nil
+	return native, nil
 }
 func (f *mp4File) editOutput(t *mp4Track, input []resolvedPicture) ([]resolvedPicture, error) {
+	edit, err := f.presentationEdit(t)
+	if err != nil {
+		return nil, err
+	}
+	return applyPresentationEdit(f.ctx, input, edit)
+}
+
+func (f *mp4File) presentationEdit(t *mp4Track) (*PresentationEdit, error) {
 	if t.edits == nil {
-		return input, nil
+		return nil, nil
 	}
 	if f.movieScale == 0 {
 		return nil, ErrInvalidBitstream
@@ -710,16 +747,7 @@ func (f *mp4File) editOutput(t *mp4Track, input []resolvedPicture) ([]resolvedPi
 	if len(t.edits.Entries) != 1 && len(t.edits.Entries) != 2 || len(t.edits.Entries) == 2 && t.edits.GetMediaTime(0) != -1 || t.edits.GetMediaTime(len(t.edits.Entries)-1) < 0 {
 		return nil, fieldError("edit-layout", ErrUnsupportedInput)
 	}
-	// Reserve the entire finite worst-case output before repeats are appended.
-	count := int64(len(input))
-	edits := int64(len(t.edits.Entries))
-	if edits != 0 && count > f.l.MaxFrames/edits {
-		return nil, ErrResourceLimit
-	}
-	if _, err := f.memory.reserve(count * edits * 512); err != nil {
-		return nil, err
-	}
-	out := make([]resolvedPicture, 0, count*edits)
+	var edit *PresentationEdit
 	var position big.Rat
 	for i, e := range t.edits.Entries {
 		if e.MediaRateInteger != 1 || e.MediaRateFraction != 0 {
@@ -738,32 +766,32 @@ func (f *mp4File) editOutput(t *mp4Track, input []resolvedPicture) ([]resolvedPi
 			num.SetInt64(time)
 			den.SetUint64(uint64(t.scale))
 			media.SetFrac(&num, &den)
-			for _, p := range input {
-				var pts, relative, mapped big.Rat
-				num.SetInt64(p.picture.PTS.Value)
-				den.SetUint64(p.picture.PTS.Timescale)
-				pts.SetFrac(&num, &den)
-				relative.Sub(&pts, &media)
-				if relative.Sign() < 0 || relative.Cmp(&duration) >= 0 {
-					continue
-				}
-				mapped.Add(&position, &relative)
-				stamp, err := timestampRat(&mapped)
-				if err != nil {
-					return nil, err
-				}
-				p.picture.PTS = stamp
-				out = append(out, p)
+			start, err := timestampRat(&media)
+			if err != nil {
+				return nil, err
 			}
+			length, err := timestampRat(&duration)
+			if err != nil {
+				return nil, err
+			}
+			offset, err := timestampRat(&position)
+			if err != nil {
+				return nil, err
+			}
+			edit = &PresentationEdit{Start: start, Duration: length, Offset: offset}
 		}
 		position.Add(&position, &duration)
 		if _, err := timestampRat(&position); err != nil {
 			return nil, err
 		}
 	}
-	return out, nil
+	return edit, nil
 }
 func extractMP4(ctx context.Context, r io.ReadSeeker, opts Options, l Limits) (result *Extraction, err error) {
+	return readMP4(ctx, r, opts, l, nil)
+}
+
+func readMP4(ctx context.Context, r io.ReadSeeker, opts Options, l Limits, factory ConsumerFactory) (result *Extraction, err error) {
 	memory := &accounting{max: l.MaxRetainedBytes, shared: opts.Budget}
 	defer memory.release()
 	if _, err := memory.reserve(8192); err != nil {
@@ -818,9 +846,12 @@ func extractMP4(ctx context.Context, r io.ReadSeeker, opts Options, l Limits) (r
 	if err := f.validateSamples(track); err != nil {
 		return nil, err
 	}
-	s, err := f.collect(track)
+	s, err := f.collect(track, factory)
 	if err != nil {
 		return nil, err
+	}
+	if factory != nil {
+		return nil, ctx.Err()
 	}
 	resolved, err := resolveFile(ctx, s, l)
 	if err != nil {

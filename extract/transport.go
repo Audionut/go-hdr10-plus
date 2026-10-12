@@ -178,7 +178,9 @@ type transportFile struct {
 	pmts       map[uint16][]byte
 	candidates map[uint16]uint16
 	early      [8192]bool
-	stream     *Stream
+	stream     Consumer
+	native     *Stream
+	factory    ConsumerFactory
 	selected   uint16
 	es         uint64
 	pes        transportPES
@@ -394,11 +396,19 @@ func (f *transportFile) section(pid uint16, data []byte) error {
 				return fieldError("video-before-program-map", ErrUnsupportedInput)
 			}
 			f.selected = id
-			s, err := newStream(StreamOptions{Key: StreamKey{TrackID: uint64(id)}, Limits: f.l, Budget: f.opts.Budget}, f.l, f.memory)
+			var err error
+			if f.factory == nil {
+				f.native, err = newStream(StreamOptions{Key: StreamKey{TrackID: uint64(id)}, Limits: f.l, Budget: f.opts.Budget}, f.l, f.memory)
+				f.stream = f.native
+			} else {
+				f.stream, err = f.factory(SourceInfo{Format: f.opts.Format, Key: StreamKey{TrackID: uint64(id)}, Framing: AnnexB})
+				if err == nil && f.stream == nil {
+					err = fieldError("nil-consumer", ErrUnsupportedInput)
+				}
+			}
 			if err != nil {
 				return err
 			}
-			f.stream = s
 		}
 	}
 	return nil
@@ -737,6 +747,10 @@ func (f *transportFile) video(p *astits.Packet) error {
 	return nil
 }
 func extractTransport(ctx context.Context, r io.ReadSeeker, opts Options, l Limits) (result *Extraction, err error) {
+	return readTransport(ctx, r, opts, l, nil)
+}
+
+func readTransport(ctx context.Context, r io.ReadSeeker, opts Options, l Limits, factory ConsumerFactory) (result *Extraction, err error) {
 	if opts.TrackID >= 0x1fff {
 		return nil, fieldError("transport-PID", ErrUnsupportedInput)
 	}
@@ -751,6 +765,7 @@ func extractTransport(ctx context.Context, r io.ReadSeeker, opts Options, l Limi
 	}
 	reader := &transportReader{ctx: ctx, r: r, size: size}
 	f := &transportFile{ctx: ctx, l: l, memory: memory, opts: opts, reader: reader, states: make(map[uint16]*transportPID), programs: make(map[uint16]uint16), pmts: make(map[uint16][]byte), candidates: make(map[uint16]uint16)}
+	f.factory = factory
 	defer func() {
 		if err != nil {
 			err = &Error{Container: map[bool]string{true: "M2TS", false: "TS"}[size == 192], Stream: StreamKey{TrackID: uint64(f.selected)}, Offset: (reader.index - 1) * uint64(size), OffsetKnown: reader.index != 0, Field: "transport", Err: err}
@@ -809,5 +824,11 @@ func extractTransport(ctx context.Context, r io.ReadSeeker, opts Options, l Limi
 	if f.pes.active && (!f.pes.decoded || !f.pes.unbounded && f.pes.remaining != 0) {
 		return nil, fieldError("final-PES", errors.Join(ErrInvalidBitstream, ErrIncomplete))
 	}
-	return finishFile(ctx, f.stream, l, opts.Budget)
+	if err := f.stream.Push(ctx, Chunk{ESOffset: f.es, Markers: []Marker{{Kind: SourceEnd, ESOffset: f.es, HasSourcePosition: true, PacketIndex: reader.index, SourceOffset: reader.index * uint64(size)}}}); err != nil {
+		return nil, err
+	}
+	if factory != nil {
+		return nil, ctx.Err()
+	}
+	return finishFile(ctx, f.native, l, opts.Budget)
 }

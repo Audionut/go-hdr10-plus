@@ -381,7 +381,7 @@ type mkvFile struct {
 	scale            uint64
 	info, trackTable bool
 	selected         *mkvTrack
-	stream           *Stream
+	stream           Consumer
 	esOffset         uint64
 	blockBuffer      []byte
 	blockCharge      *charge
@@ -1025,7 +1025,11 @@ func (f *mkvFile) pushBlock(b *ebml.Block, cluster, duration uint64, hasDuration
 	return nil
 }
 
-func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limits) (result *Extraction, err error) {
+func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limits) (*Extraction, error) {
+	return readMatroska(ctx, r, opts, l, nil)
+}
+
+func readMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limits, factory ConsumerFactory) (result *Extraction, err error) {
 	memory := &accounting{max: l.MaxRetainedBytes, shared: opts.Budget}
 	defer memory.release()
 	if _, err := memory.reserve(2*32768 + 4096); err != nil {
@@ -1081,7 +1085,16 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 	if err := f.selectTrack(opts.TrackID); err != nil {
 		return nil, err
 	}
-	f.stream, err = newStream(StreamOptions{Framing: LengthPrefixed, LengthSize: int(f.selected.config[21]&3) + 1, CodecConfig: f.selected.config, Key: StreamKey{TrackID: f.selected.number}, Limits: l, Budget: opts.Budget}, l, memory)
+	var native *Stream
+	if factory == nil {
+		native, err = newStream(StreamOptions{Framing: LengthPrefixed, LengthSize: int(f.selected.config[21]&3) + 1, CodecConfig: f.selected.config, Key: StreamKey{TrackID: f.selected.number}, Limits: l, Budget: opts.Budget}, l, memory)
+		f.stream = native
+	} else {
+		f.stream, err = factory(SourceInfo{Format: Matroska, Framing: LengthPrefixed, LengthSize: int(f.selected.config[21]&3) + 1, CodecConfig: f.selected.config, Key: StreamKey{TrackID: f.selected.number}})
+		if err == nil && f.stream == nil {
+			err = fieldError("nil-consumer", ErrUnsupportedInput)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1108,7 +1121,9 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 		return nil, err
 	}
 	if err := f.segment(segment, true); err != nil {
-		f.stream.Abort(err)
+		if native != nil {
+			native.Abort(err)
+		}
 		return nil, err
 	}
 	if _, err := c.root(); err != io.EOF {
@@ -1119,7 +1134,13 @@ func extractMatroska(ctx context.Context, r io.ReadSeeker, opts Options, l Limit
 	}
 	f.blockBuffer = nil
 	f.blockCharge.release()
-	return finishFile(ctx, f.stream, l, opts.Budget)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if native == nil {
+		return nil, nil
+	}
+	return finishFile(ctx, native, l, opts.Budget)
 }
 
 func finishFile(ctx context.Context, s *Stream, l Limits, budget *MemoryBudget) (*Extraction, error) {
@@ -1134,18 +1155,5 @@ func resolveFile(ctx context.Context, s *Stream, l Limits) (*resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.frames > (l.MaxRetainedBytes-resolutionScratch)/512 {
-		return nil, ErrResourceLimit
-	}
-	if _, err := c.memory.reserve(resolutionScratch + s.frames*512 + pocHistoryScratch); err != nil {
-		return nil, err
-	}
-	r := resolver{first: true, limits: l}
-	if err := r.resolve(ctx, c, 0); err != nil {
-		return nil, err
-	}
-	if err := r.complete(); err != nil {
-		return nil, err
-	}
-	return &r, nil
+	return resolveStandalone(ctx, c, l)
 }

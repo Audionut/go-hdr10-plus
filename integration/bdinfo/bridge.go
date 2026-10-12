@@ -205,6 +205,106 @@ func (c *consumer) Finish(end video.End) error {
 // Extraction failures remain in Outcome when ordinary reporting succeeds.
 // Verified seamless joins are still gated on the core's splice acceptance suite.
 func Scan(ctx context.Context, options Options) (*Outcome, error) {
+	c, err := NewCollector(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Release()
+	options.BDInfo.VideoConsumer = c.Consumer
+	report, reportErr := scanner.Run(ctx, options.BDInfo)
+	out, err := c.Complete(&report)
+	return out, errors.Join(reportErr, err)
+}
+
+// Collector composes HDR collection into a caller-owned BDInfo scan. Consumer
+// may be called concurrently by BDInfo. Complete and Release require that scan
+// to have joined all callbacks; Complete may be called only once.
+type Collector struct {
+	session   *session
+	completed bool
+}
+
+// Consumer accepts the scanner's borrowed bytes without owning a source reader.
+func (c *Collector) Consumer(ctx context.Context, info video.StreamInfo) (video.Consumer, error) {
+	if c == nil || c.session == nil || c.completed {
+		return nil, hdr10plus.ErrInvalidOptions
+	}
+	return c.session.factory(ctx, info)
+}
+
+// Release relinquishes physical clip storage. Completed extractions have their
+// own charges and remain usable. The caller releases those results separately.
+func (c *Collector) Release() {
+	if c == nil || c.session == nil {
+		return
+	}
+	for _, item := range c.session.collectors {
+		item.stream.Abort(extract.ErrIncomplete)
+		item.clip.Release()
+	}
+	c.session = nil
+}
+
+// Complete assembles the supplied scan's timelines without performing source IO.
+func (c *Collector) Complete(report *scanner.Result) (*Outcome, error) {
+	if c == nil || c.session == nil || c.completed || report == nil {
+		return nil, hdr10plus.ErrInvalidOptions
+	}
+	c.completed = true
+	s := c.session
+	out := &Outcome{Report: report, DeclinedAfterExhaustion: s.declined, ExhaustedSources: s.samples, Playlists: make([]PlaylistResult, 0, 16), ExhaustedPlaylists: make([]string, 0, 16), SourceErrors: make([]SourceError, 0, len(s.collectors))}
+	for key, c := range s.collectors {
+		if c.err != nil {
+			out.SourceErrors = append(out.SourceErrors, SourceError{Key: key, Err: c.err})
+		}
+	}
+	var resultBacking *extract.Reservation
+	for _, timeline := range report.Timelines {
+		// The first 16 outcomes and exhaustion names use the initial failure
+		// reservation. Later growth and error slots remain charged until return.
+		if len(out.Playlists) == cap(out.Playlists) {
+			capacity := 2 * cap(out.Playlists)
+			backing, err := s.budget.Reserve(int64(capacity) * 64)
+			var slots *extract.Reservation
+			if err == nil {
+				slots, err = s.budget.Reserve(int64(capacity-cap(out.Playlists)) * 512)
+			}
+			if err != nil {
+				backing.Release()
+				slots.Release()
+				out.OmittedPlaylistResults++
+				if len(out.ExhaustedPlaylists) < 16 {
+					name := timeline.Name
+					out.ExhaustedPlaylists = append(out.ExhaustedPlaylists, strings.Clone(name[:min(128, len(name))]))
+				}
+				continue
+			}
+			buffer := make([]PlaylistResult, len(out.Playlists), capacity)
+			copy(buffer, out.Playlists)
+			out.Playlists = buffer
+			resultBacking.Release()
+			resultBacking = backing
+		}
+		result := PlaylistResult{Name: timeline.Name}
+		charge, err := s.budget.Reserve(int64(len(timeline.Items)) * 1024)
+		var playlist extract.Playlist
+		var clips map[extract.StreamKey]*extract.Clip
+		if err == nil {
+			playlist, clips, err = s.playlist(timeline)
+		}
+		if err == nil {
+			result.Extraction, err = extract.Assemble(s.ctx, playlist, clips, extract.AssemblyOptions{Limits: s.options.Limits, Budget: s.budget})
+		}
+		charge.Release()
+		result.Err = err
+		out.Playlists = append(out.Playlists, result)
+	}
+	_, out.PeakRetainedBytes = s.budget.Usage()
+	return out, nil
+}
+
+// NewCollector prepares bounded collection without starting a scan.
+func NewCollector(ctx context.Context, options Options) (*Collector, error) {
 	if ctx == nil || options.MaxScanRetainedBytes < 0 || options.BDInfo.VideoConsumer != nil {
 		return nil, fmt.Errorf("%w: bridge options", hdr10plus.ErrInvalidOptions)
 	}
@@ -225,87 +325,17 @@ func Scan(ctx context.Context, options Options) (*Outcome, error) {
 		return nil, err
 	}
 	s := &session{ctx: ctx, options: options, budget: budget, collectors: make(map[extract.StreamKey]*consumer), samples: make([]extract.StreamKey, 0, 16)}
-	options.BDInfo.VideoConsumer = s.factory
-	report, reportErr := scanner.Run(ctx, options.BDInfo)
-	out := &Outcome{Report: &report, DeclinedAfterExhaustion: s.declined, ExhaustedSources: s.samples, Playlists: make([]PlaylistResult, 0, 16), ExhaustedPlaylists: make([]string, 0, 16), SourceErrors: make([]SourceError, 0, len(s.collectors))}
-	for key, c := range s.collectors {
-		if c.err != nil {
-			out.SourceErrors = append(out.SourceErrors, SourceError{Key: key, Err: c.err})
-		}
-	}
-	var resultBacking *extract.Reservation
-	for _, timeline := range report.Timelines {
-		// The first 16 outcomes and exhaustion names use the initial failure
-		// reservation. Later growth and error slots remain charged until return.
-		if len(out.Playlists) == cap(out.Playlists) {
-			capacity := 2 * cap(out.Playlists)
-			backing, err := budget.Reserve(int64(capacity) * 64)
-			var slots *extract.Reservation
-			if err == nil {
-				slots, err = budget.Reserve(int64(capacity-cap(out.Playlists)) * 512)
-			}
-			if err != nil {
-				backing.Release()
-				slots.Release()
-				out.OmittedPlaylistResults++
-				if len(out.ExhaustedPlaylists) < 16 {
-					name := timeline.Name
-					out.ExhaustedPlaylists = append(out.ExhaustedPlaylists, strings.Clone(name[:min(128, len(name))]))
-				}
-				continue
-			}
-			buffer := make([]PlaylistResult, len(out.Playlists), capacity)
-			copy(buffer, out.Playlists)
-			out.Playlists = buffer
-			resultBacking.Release()
-			resultBacking = backing
-		}
-		result := PlaylistResult{Name: timeline.Name}
-		charge, err := budget.Reserve(int64(len(timeline.Items)) * 1024)
-		var playlist extract.Playlist
-		var clips map[extract.StreamKey]*extract.Clip
-		if err == nil {
-			playlist, clips, err = s.playlist(timeline)
-		}
-		if err == nil {
-			result.Extraction, err = extract.Assemble(ctx, playlist, clips, extract.AssemblyOptions{Limits: options.Limits, Budget: budget})
-		}
-		charge.Release()
-		result.Err = err
-		out.Playlists = append(out.Playlists, result)
-	}
-	_, out.PeakRetainedBytes = budget.Usage()
-	return out, reportErr
+	return &Collector{session: s}, nil
 }
 
 func (s *session) playlist(t scanner.PlaylistTimeline) (extract.Playlist, map[extract.StreamKey]*extract.Clip, error) {
-	p := extract.Playlist{ID: t.Name}
-	clips := make(map[extract.StreamKey]*extract.Clip)
-	if !t.Complete || !t.Scanned || t.Err != nil {
-		return p, nil, fmt.Errorf("timeline %s: %w", t.Name, errors.Join(extract.ErrIncomplete, t.Err))
+	p, err := Timeline(s.options.BDInfo.Path, t)
+	if err != nil {
+		return p, nil, err
 	}
-	for _, item := range t.Items {
-		if item.Err != nil || item.SelectedAlternative < 0 || item.SelectedAlternative >= len(item.Angles) || item.Offset45 > math.MaxInt64 {
-			return p, nil, extract.ErrUnsupportedInput
-		}
-		angle := item.Angles[item.SelectedAlternative]
-		if angle.Err != nil || angle.STC == nil || !angle.STC.HasEndPacket || angle.STC.EndPacket <= uint64(angle.STC.StartPacket) || angle.Source.Kind != "m2ts" || (item.ConnectionCondition != 1 && item.ConnectionCondition != 5 && item.ConnectionCondition != 6) || angle.Index < 0 || uint64(angle.Index) > math.MaxUint32 || item.In45 < angle.STC.PresentationStart45 || item.Out45 > angle.STC.PresentationEnd45 {
-			return p, nil, fmt.Errorf("unverified clock/splice: %w", extract.ErrUnsupportedInput)
-		}
-		var pid uint16
-		for _, mapping := range angle.Video {
-			if mapping.Role == video.Primary && mapping.Codec == video.HEVC && mapping.EntryType == 1 {
-				if pid != 0 {
-					return p, nil, extract.ErrAmbiguousTrack
-				}
-				pid = mapping.PID
-			}
-		}
-		if pid == 0 {
-			return p, nil, extract.ErrUnsupportedInput
-		}
-		key := extract.StreamKey{SourceID: s.options.BDInfo.Path, ClipID: angle.Source.Path, TrackID: uint64(pid)}
-		c := s.collectors[key]
+	clips := make(map[extract.StreamKey]*extract.Clip)
+	for _, occurrence := range p.Occurrences {
+		c := s.collectors[occurrence.Key]
 		if c == nil && s.exhausted {
 			return p, nil, extract.ErrResourceLimit
 		}
@@ -315,12 +345,46 @@ func (s *session) playlist(t scanner.PlaylistTimeline) (extract.Playlist, map[ex
 		if c == nil || c.clip == nil {
 			return p, nil, extract.ErrIncomplete
 		}
-		clips[key] = c.clip
+		clips[occurrence.Key] = c.clip
+	}
+	return p, clips, nil
+}
+
+// Timeline validates the scanner's selected primary HEVC occurrences and maps
+// their exact clock and packet boundaries. It performs no source IO and does
+// not grant collection completeness; each consumer must prove that separately.
+func Timeline(sourceID string, t scanner.PlaylistTimeline) (extract.Playlist, error) {
+	p := extract.Playlist{ID: t.Name}
+
+	if !t.Complete || !t.Scanned || t.Err != nil {
+		return p, fmt.Errorf("timeline %s: %w", t.Name, errors.Join(extract.ErrIncomplete, t.Err))
+	}
+	for _, item := range t.Items {
+		if item.Err != nil || item.SelectedAlternative < 0 || item.SelectedAlternative >= len(item.Angles) || item.Offset45 > math.MaxInt64 {
+			return p, extract.ErrUnsupportedInput
+		}
+		angle := item.Angles[item.SelectedAlternative]
+		if angle.Err != nil || angle.STC == nil || !angle.STC.HasEndPacket || angle.STC.EndPacket <= uint64(angle.STC.StartPacket) || angle.Source.Kind != "m2ts" || (item.ConnectionCondition != 1 && item.ConnectionCondition != 5 && item.ConnectionCondition != 6) || angle.Index < 0 || uint64(angle.Index) > math.MaxUint32 || item.In45 < angle.STC.PresentationStart45 || item.Out45 > angle.STC.PresentationEnd45 {
+			return p, fmt.Errorf("unverified clock/splice: %w", extract.ErrUnsupportedInput)
+		}
+		var pid uint16
+		for _, mapping := range angle.Video {
+			if mapping.Role == video.Primary && mapping.Codec == video.HEVC && mapping.EntryType == 1 {
+				if pid != 0 {
+					return p, extract.ErrAmbiguousTrack
+				}
+				pid = mapping.PID
+			}
+		}
+		if pid == 0 {
+			return p, extract.ErrUnsupportedInput
+		}
+		key := extract.StreamKey{SourceID: sourceID, ClipID: angle.Source.Path, TrackID: uint64(pid)}
 		connection := extract.ConnectionReset
 		if len(p.Occurrences) > 0 && item.ConnectionCondition != 1 {
 			connection = extract.ConnectionSeamless
 		}
 		p.Occurrences = append(p.Occurrences, extract.Occurrence{Key: key, Angle: uint32(angle.Index), In: int64(item.In45), Out: int64(item.Out45), PlaylistStart: int64(item.Offset45), ClockOffset: extract.Timestamp{Timescale: 1, Valid: true}, Connection: connection, Packets: &extract.PacketRange{Start: uint64(angle.STC.StartPacket), End: angle.STC.EndPacket, ClockAnchor: extract.Timestamp{Value: int64(angle.STC.PresentationStart45) * 2, Timescale: 90000, Valid: true}}})
 	}
-	return p, clips, nil
+	return p, nil
 }

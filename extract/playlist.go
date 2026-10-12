@@ -202,7 +202,7 @@ func Assemble(ctx context.Context, p Playlist, clips map[StreamKey]*Clip, opts A
 			}
 		}
 		c := clips[o.Key]
-		if c == nil || c.key != o.Key || !c.boundary {
+		if c == nil || c.released || c.key != o.Key || !c.boundary || c.edit != nil {
 			return nil, fieldError("missing-boundary-clip", ErrIncomplete)
 		}
 	}

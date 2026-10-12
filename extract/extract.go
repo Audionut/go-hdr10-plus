@@ -47,52 +47,12 @@ func Extract(ctx context.Context, r io.ReadSeeker, opts Options) (*Extraction, e
 	if err != nil {
 		return nil, err
 	}
-	if opts.Format == Auto {
-		var probe [8]byte
-		position, err := r.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return nil, err
-		}
-		n := 0
-		for n < len(probe) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			read, readErr := r.Read(probe[n:])
-			n += read
-			if readErr != nil {
-				if readErr != io.EOF {
-					return nil, readErr
-				}
-				break
-			}
-			if read == 0 {
-				return nil, io.ErrNoProgress
-			}
-		}
-		if _, err := r.Seek(position, io.SeekStart); err != nil {
-			return nil, err
-		}
-		switch {
-		case n >= 4 && binary.BigEndian.Uint32(probe[:4]) == 0x1a45dfa3:
-			opts.Format = Matroska
-		case n >= 8 && (string(probe[4:8]) == "ftyp" || string(probe[4:8]) == "moov" || string(probe[4:8]) == "mdat" || string(probe[4:8]) == "free" || string(probe[4:8]) == "styp"):
-			opts.Format = MP4
-		case n >= 1 && probe[0] == 0x47:
-			opts.Format = TS
-		case n >= 5 && probe[4] == 0x47:
-			opts.Format = M2TS
-		default:
-			zeros := 0
-			for zeros < n && probe[zeros] == 0 {
-				zeros++
-			}
-			if zeros < n && (zeros < 2 || probe[zeros] != 1) {
-				return nil, fieldError("unrecognized-input", ErrUnsupportedInput)
-			}
-			opts.Format = RawHEVC
-		}
+	format, err := detectFormat(ctx, r, opts.Format)
+	if err != nil {
+		return nil, err
 	}
+	opts.Format = format
+
 	if opts.Format == Matroska {
 		return extractMatroska(ctx, r, opts, l)
 	}
@@ -117,34 +77,66 @@ func Extract(ctx context.Context, r io.ReadSeeker, opts Options) (*Extraction, e
 		s.Abort(err)
 		return nil, err
 	}
-	buffer := make([]byte, 32768)
-	var offset uint64
-	for {
-		if err := ctx.Err(); err != nil {
-			s.Abort(err)
-			return nil, err
-		}
-		n, readErr := r.Read(buffer)
-		if n > 0 {
-			if err := s.Push(ctx, Chunk{Data: buffer[:n], ESOffset: offset}); err != nil {
-				if readErr != nil && readErr != io.EOF {
-					return nil, errors.Join(err, readErr)
-				}
-				return nil, err
-			}
-			offset += uint64(n)
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				s.Abort(readErr)
-				return nil, readErr
-			}
-			break
-		}
-		if n == 0 {
-			s.Abort(io.ErrNoProgress)
-			return nil, io.ErrNoProgress
-		}
+	if err := walkRaw(ctx, r, s); err != nil {
+		s.Abort(err)
+		return nil, err
 	}
 	return finishFile(ctx, s, l, opts.Budget)
+}
+
+func detectFormat(ctx context.Context, r io.ReadSeeker, format Format) (Format, error) {
+	if format == Auto {
+		var probe [8]byte
+		position, err := r.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return Auto, err
+		}
+		n := 0
+		for n < len(probe) {
+			if err := ctx.Err(); err != nil {
+				return Auto, err
+			}
+			read, readErr := r.Read(probe[n:])
+			n += read
+			if readErr != nil {
+				if readErr != io.EOF {
+					return Auto, readErr
+				}
+				break
+			}
+			if read == 0 {
+				return Auto, io.ErrNoProgress
+			}
+		}
+		if _, err := r.Seek(position, io.SeekStart); err != nil {
+			return Auto, err
+		}
+		switch {
+		case n >= 4 && binary.BigEndian.Uint32(probe[:4]) == 0x1a45dfa3:
+			format = Matroska
+		case n >= 8 && (string(probe[4:8]) == "ftyp" || string(probe[4:8]) == "moov" || string(probe[4:8]) == "mdat" || string(probe[4:8]) == "free" || string(probe[4:8]) == "styp"):
+			format = MP4
+		case n >= 1 && probe[0] == 0x47:
+			format = TS
+		case n >= 5 && probe[4] == 0x47:
+			format = M2TS
+		default:
+			zeros := 0
+			for zeros < n && probe[zeros] == 0 {
+				zeros++
+			}
+			if zeros < n && (zeros < 2 || probe[zeros] != 1) {
+				return Auto, fieldError("unrecognized-input", ErrUnsupportedInput)
+			}
+			format = RawHEVC
+		}
+	}
+	return format, nil
+}
+
+func combineReadError(err, readErr error) error {
+	if readErr != nil && readErr != io.EOF {
+		return errors.Join(err, readErr)
+	}
+	return err
 }
