@@ -1,5 +1,9 @@
 # go-hdr10-plus
 
+A Go port of the HDR10+ brightness plotting functionality from
+[quietvoid/hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool),
+primarily intended for use with [upbrr](https://github.com/autobrr/upbrr).
+
 A pure-Go HDR10+ brightness plotting library for Go 1.27 or newer. Decode
 upstream-style metadata JSON or supply Go values, choose a peak estimator and an
 inclusive frame crop, and render an opaque 3000 × 1200 image in memory.
