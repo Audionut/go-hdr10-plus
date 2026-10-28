@@ -67,3 +67,34 @@ func TestScanFolderReportAndMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestTimelineDefaultAngle(t *testing.T) {
+	settings := scanner.DefaultSettings(".")
+	settings.FilterLoopingPlaylists = false
+	settings.FilterShortPlaylists = false
+	settings.BigPlaylistOnly = false
+	report, err := scanner.Run(t.Context(), scanner.Options{Path: discFixture(t), Settings: settings, IncludeTimeline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Timelines) == 0 || len(report.Timelines[0].Items) == 0 || len(report.Timelines[0].Items[0].Angles) == 0 {
+		t.Fatal("fixture has no default angle")
+	}
+	timeline := report.Timelines[0]
+	original := timeline.Items[0].Angles[0]
+	alternative := original
+	alternative.Index = 1
+	alternative.Source.Path = "alternate.m2ts"
+	timeline.Items[0].Angles = append(timeline.Items[0].Angles, alternative)
+	playlist, err := Timeline("source", timeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(playlist.Occurrences) != len(timeline.Items) || playlist.Occurrences[0].Key.ClipID != original.Source.Path || playlist.Occurrences[0].Angle != uint32(original.Index) {
+		t.Fatalf("default angle changed: %#v", playlist)
+	}
+	timeline.Items[0].Angles = nil
+	if _, err := Timeline("source", timeline); !errors.Is(err, extract.ErrUnsupportedInput) {
+		t.Fatalf("missing angle: got %v, want unsupported input", err)
+	}
+}

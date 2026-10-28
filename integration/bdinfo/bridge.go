@@ -350,7 +350,7 @@ func (s *session) playlist(t scanner.PlaylistTimeline) (extract.Playlist, map[ex
 	return p, clips, nil
 }
 
-// Timeline validates the scanner's selected primary HEVC occurrences and maps
+// Timeline validates the scanner's default-angle primary HEVC occurrences and maps
 // their exact clock and packet boundaries. It performs no source IO and does
 // not grant collection completeness; each consumer must prove that separately.
 func Timeline(sourceID string, t scanner.PlaylistTimeline) (extract.Playlist, error) {
@@ -360,10 +360,10 @@ func Timeline(sourceID string, t scanner.PlaylistTimeline) (extract.Playlist, er
 		return p, fmt.Errorf("timeline %s: %w", t.Name, errors.Join(extract.ErrIncomplete, t.Err))
 	}
 	for _, item := range t.Items {
-		if item.Err != nil || item.SelectedAlternative < 0 || item.SelectedAlternative >= len(item.Angles) || item.Offset45 > math.MaxInt64 {
+		if item.Err != nil || len(item.Angles) == 0 || item.Offset45 > math.MaxInt64 {
 			return p, extract.ErrUnsupportedInput
 		}
-		angle := item.Angles[item.SelectedAlternative]
+		angle := item.Angles[0]
 		if angle.Err != nil || angle.STC == nil || !angle.STC.HasEndPacket || angle.STC.EndPacket <= uint64(angle.STC.StartPacket) || angle.Source.Kind != "m2ts" || (item.ConnectionCondition != 1 && item.ConnectionCondition != 5 && item.ConnectionCondition != 6) || angle.Index < 0 || uint64(angle.Index) > math.MaxUint32 || item.In45 < angle.STC.PresentationStart45 || item.Out45 > angle.STC.PresentationEnd45 {
 			return p, fmt.Errorf("unverified clock/splice: %w", extract.ErrUnsupportedInput)
 		}
