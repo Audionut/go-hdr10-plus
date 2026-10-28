@@ -214,9 +214,9 @@ validation and a final `SourceEnd` marker carrying the observed packet count.
 These borrowed headers are not retained. A packet count does not measure IO calls.
 
 The [development BDInfo bridge](integration/bdinfo/README.md) is a separate
-GPL-compatible module using the local, unreleased issue-45 API. It is absent from
-the root dependency graph. Tests cover folder/UDF ISO timelines, shared/repeated
+GPL-compatible module pinned to an immutable development collector revision. It is
+absent from the root dependency graph. Tests cover folder/UDF ISO timelines, shared/repeated
 clips, selected STC epochs, supported seamless reference cuts, complete ES delivery
-and bounded failures. Release pinning and private-media storage/performance
+and bounded failures. Upstream adoption and private-media storage/performance
 measurements remain external validation gates. No performance overhead percentage
 is claimed. See [native fixture provenance](extract/testdata/PROVENANCE.md).

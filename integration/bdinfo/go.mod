@@ -3,7 +3,7 @@ module github.com/Audionut/go-hdr10-plus/integration/bdinfo
 go 1.27.0
 
 require (
-	github.com/Audionut/go-hdr10-plus v0.0.0
+	github.com/Audionut/go-hdr10-plus v0.0.0-20261012140645-34d94903fa8c
 	github.com/autobrr/go-bdinfo v0.0.0
 )
 
@@ -18,7 +18,5 @@ require (
 	golang.org/x/text v0.42.0 // indirect
 )
 
-// Development-only: issue-45 APIs are not yet available at an immutable release.
-replace github.com/Audionut/go-hdr10-plus => ../..
-
-replace github.com/autobrr/go-bdinfo => ../../../go-bdinfo
+// The collector API is not yet merged upstream; use its immutable development head.
+replace github.com/autobrr/go-bdinfo => github.com/Audionut/go-bdinfo v0.2.1-0.20261019003536-42be7cb0c64c

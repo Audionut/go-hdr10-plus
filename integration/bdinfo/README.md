@@ -1,22 +1,18 @@
 # Development BDInfo bridge
 
 This separate GPL-2.0-or-later module validates report-plus-HDR10+ collection
-against the uncommitted issue-45 API in the neighboring `go-bdinfo` checkout.
-The root MIT module neither imports nor requires it. Its relative development
-replacements require this layout:
+against the development collector API from
+[go-bdinfo PR #46](https://github.com/autobrr/go-bdinfo/pull/46).
+Its module manifest pins the immutable fork revision
+`42be7cb0c64c29cec8c7abf8ab9e12c77ea5bf95` and the root HDR10+ revision
+`34d94903fa8cff09fc36df1bc0e42daa40a23ed5`; no neighboring checkout is required.
+The fork replacement is temporary pending upstream adoption, not a claim that
+the API has been released upstream. The root MIT module neither imports nor
+requires this bridge.
 
-```text
-E:\github\go-hdr10-plus
-E:\github\go-bdinfo
-```
-
-There is no immutable issue-45 release to pin yet. These replacements are
-development inputs, not a reproducible released dependency. Publication must
-replace them with verified immutable versions. The authorized local BDInfo patch
-adds observed EOF packet counts and bounded original PES headers, and validates
-adaptation syntax and bounded PES payload stuffing on its optional collection
-path. Existing report parsing is
-unchanged; the original uncommitted checkout is preserved in validation receipts.
+Timeline conversion uses the scanner's default first angle and rejects missing
+angles. Alternate-angle selection is not supported; existing clock, packet and
+primary-HEVC validation still applies.
 
 `Scan(ctx, Options{BDInfo: bdinfo.Options{...}})` configures a synchronous
 consumer and performs one `bdinfo.Run`. It retains normally completed physical
